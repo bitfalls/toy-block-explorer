@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 	"html/template"
@@ -16,24 +20,144 @@ import (
 
 // GetBlockchainInfo retrieve top-level information about the blockchain
 func GetBlockchainInfo() *BlockchainInfo {
-	blockchainInfo := &BlockchainInfo{}
+	blockchainInfo := &BlockchainInfo{
+		Token: &TokenInfo{
+			TotalSupply: big.NewInt(0),
+		},
+	}
 
 	// RPC call to retrieve the latest block
+	var lastBlockStr string
+	err := RPCClient.Call(&lastBlockStr, "eth_blockNumber")
+	if err != nil {
+		log.Printf("Can't get latest block: %v", err)
+		return nil
+	}
 
 	// translate from string (hex probably) to *big.Int
+	blockchainInfo.LastBlockNum = big.NewInt(0)
+	if _, ok := blockchainInfo.LastBlockNum.SetString(lastBlockStr, 0); !ok {
+		log.Printf("Unable to parse last block string: %v", lastBlockStr)
+		return nil
+	}
 
 	// retrieve last 10 blocks, ensuring not to attempt to access an invalid block
 	maxBlock := 10
+	if int(blockchainInfo.LastBlockNum.Int64()) < maxBlock {
+		maxBlock = int(blockchainInfo.LastBlockNum.Int64())
+	}
 
 	for i := 0; i < maxBlock; i++ {
+		blockNum := big.NewInt(0).Set(blockchainInfo.LastBlockNum).Sub(blockchainInfo.LastBlockNum, big.NewInt(int64(i)))
+
 		// retrieve the block, which includes all of the transactions
+		block, err := Client.BlockByNumber(context.TODO(), blockNum)
+		if err != nil {
+			log.Printf("Error getting block %v by number: %v", blockNum, err)
+			continue
+		}
 
 		// store the block info in a struct
+		hash := block.Hash().Hex()
+		miner := block.Coinbase().Hex()
+
+		blockInfo := BlockInfo{
+			Num:              big.NewInt(0).Set(blockNum),
+			Timestamp:        time.Unix(block.Time().Int64(), 0),
+			Hash:             hash,
+			TransactionCount: len(block.Transactions()),
+			Miner:            miner,
+		}
 
 		// append the block info to the blockchain info struct
+		blockchainInfo.Blocks = append(blockchainInfo.Blocks, blockInfo)
 	}
 
 	return blockchainInfo
+}
+
+// GetTransactionsForBlock adds the transactions for ThisBlockNum into the BlockchainInfo struct
+func GetTransactionsForBlock(blockchainInfo *BlockchainInfo) {
+	// sanity check
+	if blockchainInfo.ThisBlockNum == nil {
+		log.Println("No block number to retrieve transactions from")
+		return
+	}
+
+	// retrieve the block, which includes all of the transactions
+	block, err := Client.BlockByNumber(context.TODO(), blockchainInfo.ThisBlockNum)
+	if err != nil {
+		log.Printf("Error getting block %v by number: %v", blockchainInfo.ThisBlockNum, err)
+		return
+	}
+
+	for _, transaction := range []*types.Transaction(block.Transactions()) {
+		// retrieve transaction receipt
+		receipt, err := Client.TransactionReceipt(context.TODO(), transaction.Hash())
+		if err != nil {
+			log.Printf("Error getting transaction receipt: %v", err)
+			return
+		}
+
+		transactionInfo := TransactionInfo{
+			Hash:            transaction.Hash().Hex(),
+			To:              transaction.To().Hex(),
+			Value:           big.NewInt(0).Set(transaction.Value()),
+			Data:            hex.EncodeToString(transaction.Data()),
+			ContractAddress: receipt.ContractAddress.Hex(),
+			Fee:             big.NewInt(0).Mul(transaction.GasPrice(), big.NewInt(int64(receipt.GasUsed))),
+		}
+
+		blockchainInfo.Transactions = append(blockchainInfo.Transactions, transactionInfo)
+	}
+}
+
+// GetTokenDetails returns some basic information about an ERC20 token
+func GetTokenDetails(blockchainInfo *BlockchainInfo) {
+	// bind the token
+	token, err := NewERC20Interface(blockchainInfo.TokenAddress, Client)
+	if err != nil {
+		log.Printf("Error binding token %v: %v", blockchainInfo.TokenAddress.Hex(), err)
+		return
+	}
+
+	tokenInfo := &TokenInfo{
+		Address: blockchainInfo.TokenAddress.Hex(),
+	}
+
+	// retrieve token name
+	tokenName, err := token.Name(nil)
+	if err != nil {
+		log.Printf("Error retrieving token name %v: %v", blockchainInfo.TokenAddress.Hex(), err)
+		return
+	}
+	tokenInfo.Name = tokenName
+
+	// retrieve token symbol
+	tokenSymbol, err := token.Symbol(nil)
+	if err != nil {
+		log.Printf("Error retrieving token symbol %v: %v", blockchainInfo.TokenAddress.Hex(), err)
+		return
+	}
+	tokenInfo.Symbol = tokenSymbol
+
+	// retrieve token decimals
+	tokenDecimals, err := token.Decimals(nil)
+	if err != nil {
+		log.Printf("Error retrieving token decimals %v: %v", blockchainInfo.TokenAddress.Hex(), err)
+		return
+	}
+	tokenInfo.Decimals = tokenDecimals
+
+	// retrieve token total supply
+	tokenTotalSupply, err := token.TotalSupply(nil)
+	if err != nil {
+		log.Printf("Error retrieving token total supply %v: %v", blockchainInfo.TokenAddress.Hex(), err)
+		return
+	}
+	tokenInfo.TotalSupply = tokenTotalSupply
+
+	blockchainInfo.Token = tokenInfo
 }
 
 // ShortHex returns a shortened version of a hex string
@@ -65,6 +189,19 @@ func HandleTemplates(next http.Handler) http.Handler {
 			// parse any form and query parameters
 			if err := r.ParseForm(); err != nil {
 				log.Println("Error parsing form parameters")
+			}
+
+			// retrieve optional query parameter: blocknum
+			var ok bool
+			blockchainInfo.ThisBlockNum, ok = big.NewInt(0).SetString(r.Form.Get("blocknum"), 10)
+			if ok {
+				GetTransactionsForBlock(blockchainInfo)
+			}
+
+			// retrieve optional query parameter: tokenAddress
+			if r.Form.Get("tokenAddress") != "" {
+				blockchainInfo.TokenAddress = common.HexToAddress(r.Form.Get("tokenAddress"))
+				GetTokenDetails(blockchainInfo)
 			}
 
 			// requested filename on disk
@@ -138,6 +275,9 @@ type BlockchainInfo struct {
 	LastBlockNum *big.Int
 	ThisBlockNum *big.Int
 	Blocks       []BlockInfo
+	Transactions []TransactionInfo
+	TokenAddress common.Address
+	Token        *TokenInfo
 }
 
 type BlockInfo struct {
@@ -146,6 +286,23 @@ type BlockInfo struct {
 	Hash             string
 	TransactionCount int
 	Miner            string
+}
+
+type TransactionInfo struct {
+	Hash            string
+	To              string
+	Value           *big.Int
+	Data            string
+	ContractAddress string
+	Fee             *big.Int
+}
+
+type TokenInfo struct {
+	Address     string
+	Name        string
+	Symbol      string
+	Decimals    uint8
+	TotalSupply *big.Int
 }
 
 // OptionsStruct contains global program options
@@ -184,8 +341,19 @@ func main() {
 	log.Printf("Connecting to Ethereum node at %v", Options.EthEndpoint)
 
 	// connect to RPC via the Eth client
+	var err error
+	Client, err = ethclient.Dial(Options.EthEndpoint)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer Client.Close()
 
 	// connect to RPC via the RPC client
+	RPCClient, err = rpc.Dial(Options.EthEndpoint)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer RPCClient.Close()
 
 	// start web server
 	http.Handle("/", HandleTemplates(http.FileServer(http.Dir(Options.WWWRoot))))
