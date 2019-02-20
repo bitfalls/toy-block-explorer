@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	//"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 	"html/template"
@@ -16,7 +17,36 @@ import (
 	"net/http"
 	"path/filepath"
 	"time"
+	//"crypto"
+	//"github.com/bitherhq/go-bither/crypto"
+        "github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/crypto"
+	"golang.org/x/crypto/sha3"
 )
+
+func sigHash(header *types.Header) (hash common.Hash) {
+	hasher := sha3.NewLegacyKeccak256()
+
+	rlp.Encode(hasher, []interface{}{
+		header.ParentHash,
+		header.UncleHash,
+		header.Coinbase,
+		header.Root,
+		header.TxHash,
+		header.ReceiptHash,
+		header.Bloom,
+		header.Difficulty,
+		header.Number,
+		header.GasLimit,
+		header.GasUsed,
+		header.Time,
+		header.Extra[:len(header.Extra)-65], // Yes, this will panic if extra is too short
+		header.MixDigest,
+		header.Nonce,
+	})
+	hasher.Sum(hash[:0])
+	return hash
+}
 
 // GetBlockchainInfo retrieve top-level information about the blockchain
 func GetBlockchainInfo() *BlockchainInfo {
@@ -59,7 +89,9 @@ func GetBlockchainInfo() *BlockchainInfo {
 
 		// store the block info in a struct
 		hash := block.Hash().Hex()
-		miner := block.Coinbase().Hex()
+		//miner := block.Coinbase().Hex()
+		pubkey, err := crypto.SigToPub(sigHash(block.Header()).Bytes(), block.Extra()[32:])
+		miner := crypto.PubkeyToAddress(*pubkey).Hex()
 
 		blockInfo := BlockInfo{
 			Num:              big.NewInt(0).Set(blockNum),
